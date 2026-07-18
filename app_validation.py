@@ -1,8 +1,20 @@
-
+"""
+====================================================================
+ COMPONENT MAPPING - Web App (with OCR fallback for image-only PDFs)
+====================================================================
+NEEDS: pip install streamlit pymupdf openpyxl pandas plotly pytesseract opencv-python-headless numpy
+       + Tesseract OCR must be installed on the system (see packages.txt for Streamlit Cloud)
+RUN LOCALLY: streamlit run app.py
+====================================================================
+"""
 
 import re
 import io
 import fitz
+import cv2
+import numpy as np
+import pytesseract
+from pytesseract import Output
 import openpyxl
 from openpyxl.styles import Font
 import streamlit as st
@@ -10,43 +22,98 @@ import pandas as pd
 import plotly.graph_objects as go
 
 
-def extract_component_codes(pdf_bytes):
-    """Returns (codes_list, error_message_or_None)"""
-    try:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    except Exception as e:
-        return [], f"Couldn't open this PDF - it may be corrupted or not a valid PDF file. ({e})"
+CODE_PATTERN = re.compile(r'\bCO([A-Z]{1,4}\d+[A-Z]?)\b')
+LABEL_PATTERN = re.compile(r'^[A-Z]{1,4}\d{1,4}[A-Z]?$')
 
-    pattern = re.compile(r'\bCO([A-Z]{1,4}\d+[A-Z]?)\b')
+
+# --------------------------------------------------------------
+# METHOD 1: Real text extraction (accurate, used when available)
+# --------------------------------------------------------------
+def extract_from_text(pdf_bytes):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     all_codes = set()
     total_text_length = 0
-
     for page in doc:
         text = page.get_text()
         total_text_length += len(text)
-        all_codes.update(pattern.findall(text))
+        all_codes.update(CODE_PATTERN.findall(text))
+    return sorted(all_codes), total_text_length
 
-    if total_text_length < 50:
-        return [], (
-            "This PDF appears to have little or no selectable text - it may be a "
-            "scanned image rather than a native/vector PDF. This tool needs real "
-            "embedded text (like a netlist export) to work reliably."
-        )
 
-    if len(all_codes) == 0:
-        return [], (
-            "No component codes were found. This tool looks for text patterns like "
-            "'COR100' or 'COC205' (a 'CO' prefix followed by a reference designator), "
-            "which is a common netlist export format. If your PDF uses a different "
-            "labeling convention, this pattern won't match - let me know the format "
-            "and I can adjust it."
-        )
+# --------------------------------------------------------------
+# METHOD 2: OCR fallback - for PDFs with no embedded text
+# (component labels drawn as vector shapes, not real text)
+# --------------------------------------------------------------
+def extract_from_ocr(pdf_bytes, grid=4, dpi=400):
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    found = set()
 
-    return sorted(all_codes), None
+    for page in doc:
+        pix = page.get_pixmap(dpi=dpi)
+        img_array = np.frombuffer(pix.tobytes("png"), dtype=np.uint8)
+        img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        overlap = 40
+
+        for r in range(grid):
+            for c in range(grid):
+                y1 = max(0, r * h // grid - overlap)
+                y2 = min(h, (r + 1) * h // grid + overlap)
+                x1 = max(0, c * w // grid - overlap)
+                x2 = min(w, (c + 1) * w // grid + overlap)
+                tile = gray[y1:y2, x1:x2]
+
+                for psm in [11, 6]:
+                    data = pytesseract.image_to_data(tile, output_type=Output.DICT, config=f'--psm {psm}')
+                    for i in range(len(data['text'])):
+                        t = data['text'][i].strip().upper()
+                        conf = int(data['conf'][i]) if data['conf'][i] != '-1' else -1
+                        if conf > 35 and LABEL_PATTERN.match(t):
+                            found.add(t)
+
+    return sorted(found)
+
+
+# --------------------------------------------------------------
+# MAIN EXTRACTION: tries real text first, falls back to OCR
+# --------------------------------------------------------------
+def extract_component_codes(pdf_bytes):
+    """Returns (codes, method_used, error_message_or_None)"""
+    try:
+        codes, text_length = extract_from_text(pdf_bytes)
+    except Exception as e:
+        return [], None, f"Couldn't open this PDF - it may be corrupted. ({e})"
+
+    if len(codes) > 0:
+        return codes, "text", None
+
+    # No codes found via real text - check if there's ANY text at all
+    if text_length < 50:
+        # No embedded text at all - this PDF's labels are vector art, not text.
+        # Fall back to OCR (reading the rendered image instead).
+        try:
+            ocr_codes = extract_from_ocr(pdf_bytes)
+        except Exception as e:
+            return [], None, f"OCR fallback also failed. ({e})"
+
+        if len(ocr_codes) == 0:
+            return [], None, (
+                "This PDF has no embedded text, and image-based reading (OCR) "
+                "couldn't find any component labels either. The drawing may be "
+                "too low-resolution or use an unusual label format."
+            )
+        return ocr_codes, "ocr", None
+
+    # There IS text in the PDF, just not in the expected "CO" prefix format
+    return [], None, (
+        "This PDF has embedded text, but no codes matching the expected "
+        "'CO' + reference designator pattern (e.g. 'COR100') were found. "
+        "This file may use a different netlist labeling convention."
+    )
 
 
 def load_reference_table(xlsx_bytes):
-    """Returns (lookup_dict, error_message_or_None). Handles flexible column order/names."""
     try:
         workbook = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
         sheet = workbook.active
@@ -58,14 +125,12 @@ def load_reference_table(xlsx_bytes):
         return {}, "This reference file appears to be empty."
 
     header_row = [str(h).strip().lower() if h else "" for h in rows[0]]
-    code_col = None
-    desc_col = None
+    code_col, desc_col = None, None
     for i, h in enumerate(header_row):
         if "code" in h and code_col is None:
             code_col = i
         if "desc" in h:
             desc_col = i
-
     if code_col is None:
         code_col = 0
     if desc_col is None:
@@ -75,16 +140,12 @@ def load_reference_table(xlsx_bytes):
     for row in rows[1:]:
         if len(row) <= max(code_col, desc_col):
             continue
-        code = row[code_col]
-        desc = row[desc_col]
+        code, desc = row[code_col], row[desc_col]
         if code:
             lookup[code] = desc
 
     if not lookup:
-        return {}, (
-            "Couldn't find any usable code/description rows in this reference file. "
-            "Expected columns with headers containing 'Code' and 'Description'."
-        )
+        return {}, "Couldn't find usable code/description rows. Expected headers containing 'Code' and 'Description'."
 
     return lookup, None
 
@@ -100,7 +161,7 @@ PREFIX_TO_COMMODITY_CODE = {
     'SW': 'SW000', 'F': 'PP100', 'NT': '43000',
     'ANT': '43000', 'X': 'PF400', 'Y': 'PF400',
 }
-NEEDS_REVIEW_PREFIXES = {'U', 'MP', 'TP', 'PTH', 'FD', 'FILT', 'DMC', 'Z'}
+NEEDS_REVIEW_PREFIXES = {'U', 'MP', 'TP', 'PTH', 'FD', 'FILT', 'DMC', 'Z', 'P', 'A'}
 CATEGORY_NAMES = {
     'PR000': 'Resistors', 'PC000': 'Capacitors', 'PI000': 'Inductors',
     'LDD51': 'Diodes', 'LDT30': 'Transistors', '11000': 'Connectors',
@@ -114,10 +175,8 @@ def map_component(component_code, reference_lookup):
     if prefix in PREFIX_TO_COMMODITY_CODE:
         commodity_code = PREFIX_TO_COMMODITY_CODE[prefix]
         if commodity_code in reference_lookup:
-            description = reference_lookup[commodity_code]
-            return commodity_code, description, "OK"
-        else:
-            return commodity_code, "Code not found in this reference file", "REVIEW"
+            return commodity_code, reference_lookup[commodity_code], "OK"
+        return commodity_code, "Code not found in this reference file", "REVIEW"
     elif prefix in NEEDS_REVIEW_PREFIXES:
         return "NEEDS REVIEW", f"'{prefix}' has multiple possible categories", "REVIEW"
     else:
@@ -146,13 +205,16 @@ def build_excel_bytes(component_codes, reference_lookup):
     buffer.seek(0)
     return buffer
 
+
+# --------------------------------------------------------------
+# PAGE + STYLING
+# --------------------------------------------------------------
 st.set_page_config(page_title="CompMap | Flex", page_icon="◈", layout="wide")
 
 st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap');
     html, body, [class*="css"] { font-family: 'Space Grotesk', sans-serif; }
-
     .hero {
         padding: 2.2rem 2rem; border-radius: 16px;
         background: linear-gradient(135deg, #6C5CE7 0%, #341f97 100%);
@@ -183,7 +245,7 @@ st.markdown("""
     <div class="hero-left">
         <h1>◈ CompMap</h1>
         <p>Upload a PCBA assembly drawing and commodity code table — get an instant, verified mapping report.</p>
-        <span class="badge">v1.1 · PDF text extraction · zero OCR</span>
+        <span class="badge">v1.2 · text extraction + OCR fallback</span>
     </div>
     <div class="flex-wordmark">FLEX</div>
 </div>
@@ -199,7 +261,7 @@ with col2:
 
 if pdf_file and ref_file:
     with st.spinner("Extracting and mapping components..."):
-        codes, pdf_error = extract_component_codes(pdf_file.read())
+        codes, method, pdf_error = extract_component_codes(pdf_file.read())
         reference, ref_error = load_reference_table(ref_file.read())
 
     if pdf_error:
@@ -208,6 +270,17 @@ if pdf_file and ref_file:
         st.error(f"**Reference file issue:** {ref_error}")
 
     if not pdf_error and not ref_error:
+        if method == "ocr":
+            st.warning(
+                "⚠️ **This PDF has no embedded text** — component labels appear to be "
+                "vector line-art, not real text. Results below come from image-based "
+                "reading (OCR) instead, which is significantly less complete and "
+                "accurate than text extraction. **Treat this as a rough starting point, "
+                "not a verified list** — expect this to catch only a portion of the "
+                "real components. For best results, use a PDF exported with a native "
+                "netlist/text layer."
+            )
+
         rows = []
         for i, code in enumerate(codes, start=1):
             mcode, desc, status = map_component(code, reference)
