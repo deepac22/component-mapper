@@ -3,3 +3,6 @@ pymupdf
 openpyxl
 pandas
 plotly
+pytesseract
+opencv-python-headless
+numpy
