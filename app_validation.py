@@ -1,12 +1,3 @@
-"""
-====================================================================
- COMPONENT MAPPING - Web App (with OCR fallback for image-only PDFs)
-====================================================================
-NEEDS: pip install streamlit pymupdf openpyxl pandas plotly pytesseract opencv-python-headless numpy
-       + Tesseract OCR must be installed on the system (see packages.txt for Streamlit Cloud)
-RUN LOCALLY: streamlit run app.py
-====================================================================
-"""
 
 import re
 import io
