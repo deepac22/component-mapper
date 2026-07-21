@@ -1,9 +1,6 @@
 streamlit
-pymupdf
-openpyxl
 pandas
+openpyxl
 pytesseract
-opencv-python-headless
-numpy
-ezdxf
+pdf2image
 Pillow
