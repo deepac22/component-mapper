@@ -1,236 +1,334 @@
+"""
+Flex PCBA CompMap – Component Mapping Web App
+Supports: PDF (text + OCR fallback), DXF, PNG/JPG/TIFF/BMP
+Matches components to a reference Excel using category keywords.
+"""
+
+import io
+import re
+import numpy as np
+import cv2
+import pytesseract
+from pytesseract import Output
+import fitz   # PyMuPDF
+import ezdxf
+import openpyxl
+from openpyxl.styles import Font
 import streamlit as st
 import pandas as pd
-import re
-import io
 from PIL import Image
-import pytesseract
-from pdf2image import convert_from_bytes
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment
 
-st.set_page_config(page_title="Flex PCBA Mapper", page_icon="🔧", layout="wide")
+# -------------------------------------------------------------------
+# Styling & page setup
+# -------------------------------------------------------------------
+st.set_page_config(page_title="CompMap | Flex", page_icon="◆", layout="wide")
 
-st.markdown(
-    """
-    <div style="display:flex; align-items:center; gap:15px; margin-bottom:20px;">
-        <svg width="140" viewBox="0 0 280 80">
-            <text x="10" y="56" font-family="Arial" font-size="52" font-weight="700" fill="#0077C8">flex</text>
-            <text x="14" y="72" font-family="Arial" font-size="11" font-weight="500" letter-spacing="3.5" fill="#8899aa">PCBA COMPONENT MAPPER</text>
-        </svg>
-        <div style="font-size:1.2rem; font-weight:600; color:#2c3e50;">
-            <span style="color:#0077C8;">PCBA</span> Component Mapping Tool
-        </div>
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;500&display=swap');
+    html, body, [class*="css"] { font-family: 'Space Grotesk', sans-serif; }
+    .hero {
+        padding: 2.2rem 2rem; border-radius: 16px;
+        background: linear-gradient(135deg, #0091D5 0%, #005A8C 100%);
+        margin-bottom: 1.8rem; box-shadow: 0 8px 32px rgba(0, 145, 213, 0.25);
+        display: flex; justify-content: space-between; align-items: center;
+    }
+    .hero-left h1 { color: white; font-size: 2rem; font-weight: 700; margin: 0; letter-spacing: -0.02em; }
+    .hero-left p { color: rgba(255,255,255,0.9); margin-top: 0.4rem; font-size: 0.95rem; }
+    .badge {
+        display: inline-block; background: rgba(255,255,255,0.2); color: white;
+        padding: 3px 12px; border-radius: 20px; font-size: 0.7rem;
+        font-family: 'JetBrains Mono', monospace; letter-spacing: 0.05em; margin-top: 0.6rem;
+    }
+    .flex-wordmark {
+        font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 1.4rem;
+        color: #0091D5; background: white; letter-spacing: 0.02em;
+        padding: 8px 20px; border-radius: 8px;
+    }
+    div[data-testid="stMetric"] { background: #F0F8FC; border: 1px solid #B3E0F5; border-radius: 12px; padding: 1rem 1.2rem; }
+    div[data-testid="stMetricValue"] { font-family: 'JetBrains Mono', monospace; color: #0091D5; }
+    .stDataFrame { border-radius: 12px; overflow: hidden; }
+    div[data-testid="stFileUploader"] { border: 1px dashed #0091D5; border-radius: 12px; padding: 0.5rem; }
+</style>
+""", unsafe_allow_html=True)
+
+st.markdown("""
+<div class="hero">
+    <div class="hero-left">
+        <h1>◆ CompMap</h1>
+        <p>Upload a PCBA assembly drawing (PDF, DXF, or image) and a reference file — get a mapping report.</p>
+        <span class="badge">v2.1 · multi-format input · dynamic reference matching</span>
     </div>
-    """,
-    unsafe_allow_html=True,
-)
-st.markdown("Upload your **PCBA Assembly Drawing** and **BOM Excel** to automatically map components and download a report.")
+    <div class="flex-wordmark">flex</div>
+</div>
+""", unsafe_allow_html=True)
 
-# Tesseract path
+# -------------------------------------------------------------------
+# Patterns and helpers
+# -------------------------------------------------------------------
+CODE_PATTERN = re.compile(r'\bCO([A-Z]{1,4}\d+[A-Z]?)\b')
+LABEL_PATTERN = re.compile(r'^[A-Z]{1,4}\d{1,4}[A-Z]?$')
+
 pytesseract.pytesseract.tesseract_cmd = "/usr/bin/tesseract"
 
-COMP_PREFIXES = [
-    'R', 'C', 'L', 'D', 'Q', 'U', 'J', 'TP', 'X', 'Y',
-    'FB', 'T', 'F', 'P', 'K', 'S', 'W', 'Z', 'M', 'A',
-    'B', 'E', 'G', 'H', 'N', 'V', 'IC', 'CN', 'JP', 'SW',
-]
+def ocr_grayscale_image(gray_image, grid=4):
+    found = set()
+    h, w = gray_image.shape
+    overlap = 40
+    for r in range(grid):
+        for c in range(grid):
+            y1 = max(0, r * h // grid - overlap)
+            y2 = min(h, (r + 1) * h // grid + overlap)
+            x1 = max(0, c * w // grid - overlap)
+            x2 = min(w, (c + 1) * w // grid + overlap)
+            tile = gray_image[y1:y2, x1:x2]
+            for psm in [11, 6]:
+                data = pytesseract.image_to_data(tile, output_type=Output.DICT, config=f'--psm {psm}')
+                for i in range(len(data['text'])):
+                    t = data['text'][i].strip().upper()
+                    conf = int(data['conf'][i]) if data['conf'][i] != '-1' else -1
+                    if conf > 35 and LABEL_PATTERN.match(t):
+                        found.add(t)
+    return found
 
-def extract_text_from_image(image_bytes):
-    image = Image.open(io.BytesIO(image_bytes)).convert('RGB')
-    return pytesseract.image_to_string(image)
+def extract_from_pdf(file_bytes):
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    all_codes = set()
+    total_text_length = 0
+    for page in doc:
+        text = page.get_text()
+        total_text_length += len(text)
+        all_codes.update(CODE_PATTERN.findall(text))
+    if len(all_codes) > 0:
+        return sorted(all_codes), "text", None
+    if total_text_length < 50:
+        ocr_found = set()
+        for page in doc:
+            pix = page.get_pixmap(dpi=400)
+            img_array = np.frombuffer(pix.tobytes("png"), dtype=np.uint8)
+            img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            ocr_found |= ocr_grayscale_image(gray)
+        if len(ocr_found) == 0:
+            return [], None, "No embedded text, and OCR found no component labels either."
+        return sorted(ocr_found), "ocr", None
+    return [], None, "PDF has text, but no 'CO' + designator pattern was found."
 
-def extract_text_from_pdf(pdf_bytes):
-    pages = convert_from_bytes(pdf_bytes, dpi=300)
-    text = ""
-    for page in pages:
-        text += pytesseract.image_to_string(page) + "\n"
-    return text
+def extract_from_dxf(file_bytes):
+    try:
+        text_stream = io.StringIO(file_bytes.decode('utf-8', errors='ignore'))
+        doc = ezdxf.read(text_stream)
+    except Exception as e:
+        return [], f"Couldn't read this DXF file. ({e})"
+    msp = doc.modelspace()
+    found = set()
+    for entity in msp.query('TEXT MTEXT ATTRIB'):
+        try:
+            text = entity.dxf.text if entity.dxftype() != 'MTEXT' else entity.text
+        except Exception:
+            continue
+        if text and LABEL_PATTERN.match(text.strip().upper()):
+            found.add(text.strip().upper())
+    if len(found) == 0:
+        return [], "No component labels found in this DXF's text entities. The labels may be on a layer this parser didn't check, or drawn as geometry instead of text."
+    return sorted(found), None
 
-def extract_component_codes(text):
-    codes = set()
-    prefix_pattern = '|'.join(COMP_PREFIXES)
-    pattern = re.compile(r'\b(' + prefix_pattern + r')(\d+[A-Za-z]?)\b', re.IGNORECASE)
-    for match in pattern.finditer(text):
-        codes.add(match.group().upper())
-    return sorted(codes)
+def extract_from_image(file_bytes):
+    try:
+        pil_image = Image.open(io.BytesIO(file_bytes)).convert("RGB")
+        img_array = np.array(pil_image)
+        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+    except Exception as e:
+        return [], f"Couldn't open this image file. ({e})"
+    found = ocr_grayscale_image(gray)
+    if len(found) == 0:
+        return [], "OCR couldn't find any component labels in this image."
+    return sorted(found), None
 
-def normalize_code(code: str) -> str:
-    """Remove leading zeros from numeric part and uppercase.
-       e.g., R001 -> R1, C020 -> C20."""
-    code = code.strip().upper()
-    # Separate prefix and number
-    match = re.match(r'^([A-Z]+)(\d+)([A-Z]*)$', code)
-    if match:
-        prefix, num, suffix = match.groups()
-        num = num.lstrip('0') or '0'
-        return prefix + num + suffix
-    return code
-
-def parse_bom_smart(file_bytes, drawing_codes):
-    """Try to find the best column for component codes."""
-    df = pd.read_excel(io.BytesIO(file_bytes))
-    comp_col = None
-    part_col = None
-
-    # Step 1: keyword detection
-    for col in df.columns:
-        col_lower = str(col).lower()
-        if comp_col is None and re.search(r'component\s*code|ref\s*des|designator|item\s*code|code|reference', col_lower):
-            comp_col = col
-        if part_col is None and re.search(r'part\s*no|part\s*number|pn|part\s*#|manufacturer\s*part', col_lower):
-            part_col = col
-
-    # Fallback part number column
-    if part_col is None:
-        part_col = df.columns[1] if len(df.columns) > 1 else None
-
-    # Step 2: if keyword didn't find a good column, scan all cells for matching codes
-    if comp_col is None:
-        # Try every column and count how many drawing codes are found
-        best_match_count = 0
-        best_col = None
-        for col in df.columns:
-            # Get values as strings
-            values = df[col].astype(str).str.strip().str.upper()
-            normalized_values = values.apply(normalize_code)
-            # Count how many drawing codes appear in this column
-            matches = sum(1 for code in drawing_codes if code in normalized_values.values or normalize_code(code) in normalized_values.values)
-            if matches > best_match_count:
-                best_match_count = matches
-                best_col = col
-        comp_col = best_col if best_match_count > 0 else df.columns[0]
+def extract_component_codes(uploaded_file):
+    filename = uploaded_file.name.lower()
+    file_bytes = uploaded_file.read()
+    if filename.endswith('.pdf'):
+        codes, method, error = extract_from_pdf(file_bytes)
+        return codes, method, error
+    elif filename.endswith('.dxf'):
+        codes, error = extract_from_dxf(file_bytes)
+        return codes, "dxf-text", error
+    elif filename.endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp')):
+        codes, error = extract_from_image(file_bytes)
+        return codes, "ocr", error
+    elif filename.endswith('.dwg'):
+        return [], None, "**.dwg files are not supported.** Please re-export as PDF or DXF."
     else:
-        # Check if the initially detected column actually matches well
-        values = df[comp_col].astype(str).str.strip().str.upper()
-        normalized_values = values.apply(normalize_code)
-        match_count = sum(1 for code in drawing_codes if code in normalized_values.values or normalize_code(code) in normalized_values.values)
-        if match_count < 0.1 * len(drawing_codes):  # less than 10% match
-            # The detected column is probably wrong, try scanning again
-            best_match_count = 0
-            best_col = None
-            for col in df.columns:
-                values = df[col].astype(str).str.strip().str.upper()
-                normalized_values = values.apply(normalize_code)
-                matches = sum(1 for code in drawing_codes if code in normalized_values.values or normalize_code(code) in normalized_values.values)
-                if matches > best_match_count:
-                    best_match_count = matches
-                    best_col = col
-            if best_col and best_match_count > match_count:
-                comp_col = best_col
+        return [], None, f"Unsupported file type: {filename.split('.')[-1] if '.' in filename else 'unknown'}"
 
-    # Build mapping: normalised component code -> part number
-    mapping = {}
-    if comp_col and part_col:
-        for _, row in df.iterrows():
-            code_raw = str(row[comp_col]).strip()
-            part_raw = str(row[part_col]).strip()
-            if code_raw.lower() == 'nan' or part_raw.lower() == 'nan':
+# -------------------------------------------------------------------
+# Reference table handling
+# -------------------------------------------------------------------
+def load_reference_table(xlsx_bytes):
+    try:
+        workbook = openpyxl.load_workbook(io.BytesIO(xlsx_bytes), data_only=True)
+        sheet = workbook.active
+    except Exception as e:
+        return [], f"Couldn't open this Excel file. ({e})"
+    rows = list(sheet.iter_rows(min_row=1, values_only=True))
+    if not rows:
+        return [], "This reference file appears to be empty."
+    header_row = [str(h).strip().lower() if h else "" for h in rows[0]]
+    code_col, desc_col = None, None
+    for i, h in enumerate(header_row):
+        if "code" in h and code_col is None:
+            code_col = i
+        if "desc" in h:
+            desc_col = i
+    if code_col is None:
+        code_col = 0
+    if desc_col is None:
+        desc_col = 2 if len(header_row) > 2 else len(header_row) - 1
+    entries = []
+    for row in rows[1:]:
+        if len(row) <= max(code_col, desc_col):
+            continue
+        code, desc = row[code_col], row[desc_col]
+        if code and desc:
+            entries.append((code, str(desc)))
+    if not entries:
+        return [], "Couldn't find usable code/description rows. Expected headers containing 'Code' and 'Description'."
+    return entries, None
+
+def get_prefix(component_code):
+    match = re.match(r'^([A-Z]+)\d', component_code)
+    return match.group(1) if match else component_code
+
+PREFIX_TO_KEYWORDS = {
+    'R': ['RESISTOR'], 'C': ['CAPACITOR'], 'L': ['INDUCTOR'],
+    'D': ['DIODE', 'RECTIFIER'], 'Q': ['TRANSISTOR'], 'J': ['CONNECTOR'],
+    'SW': ['SWITCH'], 'F': ['FUSE'], 'NT': ['ANTENNA'], 'ANT': ['ANTENNA'],
+    'X': ['CRYSTAL', 'OSCILLATOR'], 'Y': ['CRYSTAL', 'OSCILLATOR'],
+}
+NEEDS_REVIEW_PREFIXES = {'U', 'MP', 'TP', 'PTH', 'FD', 'FILT', 'DMC', 'Z', 'P', 'A'}
+
+def find_match_in_reference(keywords, reference_entries):
+    best_match = None
+    best_extra_word_count = None
+    for keyword in keywords:
+        for code, description in reference_entries:
+            words = re.findall(r'[A-Za-z]+', description.upper())
+            keyword_word_matches = [w for w in words if keyword in w]
+            if not keyword_word_matches:
                 continue
-            code = normalize_code(code_raw)
-            mapping[code] = part_raw
-    return mapping
+            extra_words = len(words) - len(keyword_word_matches)
+            if best_extra_word_count is None or extra_words < best_extra_word_count:
+                best_extra_word_count = extra_words
+                best_match = (code, description)
+        if best_match:
+            break
+    return best_match
 
-def generate_excel(results):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "PCBA Mapping"
-    header_fill = PatternFill(start_color="0077C8", end_color="0077C8", fill_type="solid")
-    headers = ["PartNo", "Component code in drawing", "Mapping code"]
-    for col, h in enumerate(headers, 1):
-        cell = ws.cell(row=1, column=col, value=h)
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = header_fill
-        cell.alignment = Alignment(horizontal="center")
-    for row_idx, item in enumerate(results, 2):
-        ws.cell(row=row_idx, column=1, value=item['part_no'])
-        ws.cell(row=row_idx, column=2, value=item['component_code_in_drawing'])
-        ws.cell(row=row_idx, column=3, value=item['mapping_code'])
-    for col in ws.columns:
-        max_len = max((len(str(c.value)) for c in col if c.value), default=8)
-        ws.column_dimensions[col[0].column_letter].width = min(max_len + 2, 50)
-    output = io.BytesIO()
-    wb.save(output)
-    output.seek(0)
-    return output
+def map_component(component_code, reference_entries):
+    prefix = get_prefix(component_code)
+    if prefix in PREFIX_TO_KEYWORDS:
+        match = find_match_in_reference(PREFIX_TO_KEYWORDS[prefix], reference_entries)
+        if match:
+            code, description = match
+            return code, description, "OK"
+        return "NOT IN FILE", f"No '{PREFIX_TO_KEYWORDS[prefix][0]}' category found in this reference file", "REVIEW"
+    elif prefix in NEEDS_REVIEW_PREFIXES:
+        return "NEEDS REVIEW", f"'{prefix}' has multiple possible categories – manual classification needed", "REVIEW"
+    else:
+        return "UNKNOWN PREFIX", f"'{prefix}' is not a recognized component family", "REVIEW"
 
-# --- UI ---
+def build_excel_bytes(component_codes, reference_entries):
+    workbook = openpyxl.Workbook()
+    sheet = workbook.active
+    sheet.title = "Sheet1"
+    headers = ["Partno", "Component code in the drawing", "Mapping Code", "Description", "Status"]
+    for col_num, header in enumerate(headers, start=1):
+        sheet.cell(row=1, column=col_num, value=header).font = Font(bold=True)
+    for row_num, code in enumerate(component_codes, start=2):
+        commodity_code, description, status = map_component(code, reference_entries)
+        sheet.cell(row=row_num, column=1, value=row_num - 1)
+        sheet.cell(row=row_num, column=2, value=code)
+        sheet.cell(row=row_num, column=3, value=commodity_code)
+        sheet.cell(row=row_num, column=4, value=description)
+        sheet.cell(row=row_num, column=5, value=status)
+    for col, width in {"A": 8, "B": 30, "C": 16, "D": 45, "E": 12}.items():
+        sheet.column_dimensions[col].width = width
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+# -------------------------------------------------------------------
+# Main app UI
+# -------------------------------------------------------------------
 col1, col2 = st.columns(2)
 with col1:
-    st.subheader("📐 PCBA Assembly Drawing")
+    st.markdown("**📄 Assembly Drawing** — PDF, DXF, PNG, JPG, TIFF, or BMP")
     drawing_file = st.file_uploader(
-        "Upload the assembly drawing",
-        type=["pdf", "png", "jpg", "jpeg", "tif", "tiff", "bmp", "webp"],
-        key="drawing"
+        "Drawing", type=["pdf", "dxf", "png", "jpg", "jpeg", "tif", "tiff", "bmp", "dwg"],
+        label_visibility="collapsed"
     )
 with col2:
-    st.subheader("📊 BOM Excel File")
-    bom_file = st.file_uploader(
-        "Upload the Bill of Materials",
-        type=["xlsx", "xls"],
-        key="bom"
-    )
+    st.markdown("**📋 Component Reference File** (.xlsx with 'Code' and 'Description' columns)")
+    ref_file = st.file_uploader("Excel", type=["xlsx"], label_visibility="collapsed")
 
-if drawing_file and bom_file:
-    if st.button("⚡ Process & Generate Report", type="primary", use_container_width=True):
-        with st.spinner("Processing drawing and BOM... This may take a moment."):
-            drawing_bytes = drawing_file.read()
-            fname = drawing_file.name.lower()
-            try:
-                if fname.endswith('.pdf'):
-                    full_text = extract_text_from_pdf(drawing_bytes)
-                else:
-                    full_text = extract_text_from_image(drawing_bytes)
-            except Exception as e:
-                st.error(f"Failed to process drawing: {e}")
-                st.stop()
+if drawing_file and ref_file:
+    with st.spinner("Extracting and mapping components..."):
+        codes, method, drawing_error = extract_component_codes(drawing_file)
+        reference_entries, ref_error = load_reference_table(ref_file.read())
 
-            codes = extract_component_codes(full_text)
+    if drawing_error:
+        st.error(f"**Drawing issue:** {drawing_error}")
+    if ref_error:
+        st.error(f"**Reference file issue:** {ref_error}")
 
-            bom_bytes = bom_file.read()
-            try:
-                bom_map = parse_bom_smart(bom_bytes, codes)
-            except Exception as e:
-                st.error(f"Failed to parse BOM: {e}")
-                st.stop()
-
-            # Mapping with normalised codes
-            results = []
-            for code in codes:
-                norm_code = normalize_code(code)
-                part = bom_map.get(norm_code, "")
-                mapping_code = norm_code if part else ""
-                results.append({
-                    'part_no': part,
-                    'component_code_in_drawing': code,
-                    'mapping_code': mapping_code,
-                    'status': 'MATCHED' if part else 'NOT_IN_BOM'
-                })
-
-            matched = sum(1 for r in results if r['status'] == 'MATCHED')
-            not_found = len(results) - matched
-
-            st.success("✅ Processing complete!")
-            col_m1, col_m2, col_m3 = st.columns(3)
-            col_m1.metric("🔍 Drawing Components", len(codes))
-            col_m2.metric("✅ Matched with BOM", matched)
-            col_m3.metric("❌ Not Found in BOM", not_found)
-
-            st.subheader("📋 Mapping Table")
-            df_display = pd.DataFrame(results)
-            df_display.columns = ["PartNo", "Component Code in Drawing", "Mapping Code", "Status"]
-            st.dataframe(df_display[["PartNo", "Component Code in Drawing", "Mapping Code", "Status"]],
-                         use_container_width=True, hide_index=True)
-
-            excel_data = generate_excel(results)
-            st.download_button(
-                label="📥 Download Excel Report",
-                data=excel_data,
-                file_name="pcba_mapping_report.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
+    if not drawing_error and not ref_error:
+        if method == "ocr":
+            st.warning(
+                "⚠️ **This file has no embedded text** — results come from image‑based "
+                "reading (OCR), which is significantly less complete than text extraction. "
+                "Treat this as a rough starting point, not a verified list."
             )
+        elif method == "dxf-text":
+            st.info("✓ Read directly from DXF text entities — same reliability as PDF text extraction.")
 
-            with st.expander("🔎 View extracted text from drawing (for debugging)"):
-                st.text_area("OCR Output", full_text, height=200)
+        rows = []
+        for i, code in enumerate(codes, start=1):
+            mcode, desc, status = map_component(code, reference_entries)
+            rows.append({
+                "Partno": i,
+                "Component code in the drawing": code,
+                "Mapping Code": mcode,
+                "Description": desc,
+                "Status": status,
+            })
+        df = pd.DataFrame(rows)
+
+        ok_count = int((df["Status"] == "OK").sum())
+        review_count = int((df["Status"] == "REVIEW").sum())
+        match_rate = round(100 * ok_count / len(df), 1) if len(df) else 0
+
+        st.markdown("### Results")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Total components", len(df))
+        m2.metric("Confidently mapped", ok_count)
+        m3.metric("Needs review", review_count)
+        m4.metric("Match rate", f"{match_rate}%")
+
+        tab1, tab2 = st.tabs(["All components", "Needs review"])
+        with tab1:
+            st.dataframe(df, use_container_width=True, height=400)
+        with tab2:
+            st.dataframe(df[df["Status"] == "REVIEW"], use_container_width=True, height=300)
+
+        excel_bytes = build_excel_bytes(codes, reference_entries)
+        st.download_button(
+            "⬇ Download Excel Report",
+            data=excel_bytes,
+            file_name="Component_Mapping_Report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 else:
-    st.info("👆 Please upload both files to start mapping.")
+    st.info("Upload both files above to generate your report.")
+    
