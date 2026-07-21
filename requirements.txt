@@ -2,5 +2,7 @@ streamlit
 pandas
 openpyxl
 pytesseract
-pdf2image
+PyMuPDF
+opencv-python-headless
+ezdxf
 Pillow
