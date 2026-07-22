@@ -1,16 +1,5 @@
-"""
-====================================================================
- COMPONENT MAPPING - Web App (multi-format input, category matching)
-====================================================================
-SUPPORTED ASSEMBLY DRAWING FORMATS:
-  - PDF   (text extraction, falls back to OCR if no embedded text)
-  - DXF   (CAD text-exchange format - real text, parsed directly)
-  - PNG / JPG / JPEG / TIFF / BMP (images - read via OCR)
-  - DWG   NOT supported - proprietary AutoCAD binary format, no
-          reliable free library exists to read it. Users are told
-          to re-export as PDF or DXF instead.
-====================================================================
-"""
+
+
 
 import re
 import io
